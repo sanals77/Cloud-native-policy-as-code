@@ -87,16 +87,15 @@ jobs:
         continue-on-error: true
 
       - name: Sign container images
-        if: ${{ secrets.COSIGN_PRIVATE_KEY != '' }}
+        if: false
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ steps.set-tag.outputs.tag }}
+          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
         run: |
           cosign sign --key env://COSIGN_PRIVATE_KEY $ECR_REGISTRY/${{ env.ECR_API_REPOSITORY }}:$IMAGE_TAG || echo "Skipping image signing"
           cosign sign --key env://COSIGN_PRIVATE_KEY $ECR_REGISTRY/${{ env.ECR_WORKER_REPOSITORY }}:$IMAGE_TAG || echo "Skipping image signing"
-        env:
-          COSIGN_PRIVATE_KEY: ${{ secrets.COSIGN_PRIVATE_KEY }}
-          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
         continue-on-error: true
 
   # Deploy to Dev

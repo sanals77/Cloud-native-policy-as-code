@@ -37,6 +37,11 @@ jobs:
           chmod +x opa
           sudo mv opa /usr/local/bin/
 
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
       - name: "📋 Display Non-Compliant Manifest"
         run: |
           echo "=== Non-Compliant Kubernetes Manifest ===" 
@@ -151,6 +156,11 @@ jobs:
           curl -L -o opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64
           chmod +x opa
           sudo mv opa /usr/local/bin/
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
 
       - name: "📋 Display Non-Compliant Manifest"
         run: |
@@ -410,10 +420,11 @@ jobs:
           echo ""
           cat experiments/04-terraform-security/non-compliant.tfvars
 
-      - name: "🔧 Initialize Terraform"
+      - name: "🔧 Initialize Terraform (Optional)"
+        id: terraform-init
         run: |
           cd experiments/04-terraform-security
-          terraform init -backend=false -upgrade
+          terraform init -backend=false -upgrade 2>&1 || echo "Terraform init skipped - using pre-generated plans"
         continue-on-error: true
 
       - name: "🔍 Validate Non-Compliant Plan with OPA"

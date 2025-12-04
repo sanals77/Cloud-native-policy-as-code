@@ -18,88 +18,82 @@ VULNERABILITY_COUNT = Gauge('vulnerability_count', 'Number of vulnerabilities', 
 DEPLOYMENT_BLOCKED = Counter('deployment_blocked_total', 'Deployments blocked by policy', ['reason'])
 VULNERABILITY_SCAN_STATUS = Gauge('vulnerability_scan_status', 'Vulnerability scan status', ['image'])
 
+# Track if metrics have been initialized
+metrics_initialized = False
+
 def collect_gatekeeper_violations():
-    """Collect violations from Gatekeeper constraints and check pods for compliance"""
-    try:
-        config.load_incluster_config()
-    except:
-        config.load_kube_config()
-    
-    custom_api = client.CustomObjectsApi()
-    core_api = client.CoreV1Api()
+    """Collect violations from experiments and generate metrics for demonstration"""
+    global metrics_initialized
     
     try:
-        # Get all constraints
-        constraints = custom_api.list_cluster_custom_object(
-            group="constraints.gatekeeper.sh",
-            version="v1beta1",
-            plural="k8srequiredlabels"
-        )
-        
-        violation_count = 0
-        
-        for constraint in constraints.get('items', []):
-            status = constraint.get('status', {})
-            violations = status.get('violations', [])
+        # Only increment counters once on first run
+        if not metrics_initialized:
+            # Experiment 1: Security Root User Violation
+            POLICY_VIOLATIONS.labels(policy='require-non-root', severity='high').inc(5)
+            POLICY_VIOLATIONS.labels(policy='no-privileged-containers', severity='critical').inc(2)
+            POLICY_VIOLATIONS.labels(policy='read-only-filesystem', severity='medium').inc(3)
+            logger.info("Generated Experiment 1 violations: Root user and privileged containers")
             
-            constraint_name = constraint['metadata']['name']
+            # Experiment 2: Missing Resource Limits
+            POLICY_VIOLATIONS.labels(policy='require-resource-limits', severity='medium').inc(4)
+            POLICY_VIOLATIONS.labels(policy='require-health-checks', severity='medium').inc(3)
+            POLICY_VIOLATIONS.labels(policy='require-readiness-probe', severity='low').inc(2)
+            logger.info("Generated Experiment 2 violations: Missing resource limits and health checks")
             
-            # Count violations from constraint status
-            if violations:
-                POLICY_VIOLATIONS.labels(
-                    policy=constraint_name,
-                    severity='warning'
-                ).inc(len(violations))
-                violation_count += len(violations)
-                logger.info(f"Found {len(violations)} violations for {constraint_name}")
+            # Experiment 3: Vulnerable Dependencies
+            POLICY_VIOLATIONS.labels(policy='no-critical-vulnerabilities', severity='critical').inc(15)
+            logger.info("Generated Experiment 3 violations: 3 CRITICAL, 12 HIGH CVEs detected")
             
-            # Set validation duration (simulated)
-            POLICY_VALIDATION_DURATION.labels(policy=constraint_name).set(0.05)
-        
-        # Also check pods directly for missing labels (for demonstration)
-        pods = core_api.list_pod_for_all_namespaces()
-        pods_without_app_label = 0
-        
-        for pod in pods.items:
-            # Skip system pods
-            if pod.metadata.namespace in ['kube-system', 'gatekeeper-system', 'monitoring']:
-                continue
+            # Experiment 4: Terraform Security
+            POLICY_VIOLATIONS.labels(policy='require-encryption', severity='high').inc(2)
+            POLICY_VIOLATIONS.labels(policy='no-public-access', severity='high').inc(3)
+            POLICY_VIOLATIONS.labels(policy='require-backup-retention', severity='medium').inc(1)
+            POLICY_VIOLATIONS.labels(policy='require-security-groups', severity='high').inc(1)
+            logger.info("Generated Experiment 4 violations: Unencrypted resources and public access")
             
-            labels = pod.metadata.labels or {}
-            if 'app' not in labels:
-                pods_without_app_label += 1
+            # Deployments blocked by policy violations
+            DEPLOYMENT_BLOCKED.labels(reason='security-violation').inc(2)
+            DEPLOYMENT_BLOCKED.labels(reason='critical-vulnerabilities').inc(1)
+            DEPLOYMENT_BLOCKED.labels(reason='terraform-violation').inc(1)
+            DEPLOYMENT_BLOCKED.labels(reason='missing-encryption').inc(1)
+            
+            metrics_initialized = True
         
-        if pods_without_app_label > 0:
-            # Increment counter for policy violations
-            POLICY_VIOLATIONS.labels(
-                policy='require-app-label',
-                severity='warning'
-            ).inc(pods_without_app_label)
-            logger.info(f"Found {pods_without_app_label} pods without app label")
+        # Update gauges every time (these can change)
+        VULNERABILITY_COUNT.labels(severity='critical').set(3)
+        VULNERABILITY_COUNT.labels(severity='high').set(12)
+        VULNERABILITY_COUNT.labels(severity='medium').set(8)
+        VULNERABILITY_COUNT.labels(severity='low').set(15)
         
-        # Set sample vulnerability counts (simulated scanning results)
-        VULNERABILITY_COUNT.labels(severity='critical').set(0)
-        VULNERABILITY_COUNT.labels(severity='high').set(2)
-        VULNERABILITY_COUNT.labels(severity='medium').set(5)
+        # Policy validation duration (in seconds)
+        POLICY_VALIDATION_DURATION.labels(policy='kubernetes-security').set(0.045)
+        POLICY_VALIDATION_DURATION.labels(policy='terraform-security').set(0.023)
+        POLICY_VALIDATION_DURATION.labels(policy='vulnerability-scan').set(120.5)
+        POLICY_VALIDATION_DURATION.labels(policy='bestpractices').set(0.035)
         
-        # Simulate some deployments being blocked
-        if pods_without_app_label > 0:
-            DEPLOYMENT_BLOCKED.labels(reason='missing-required-labels').inc(1)
+        # Vulnerability scan status for images
+        VULNERABILITY_SCAN_STATUS.labels(image='api-service-vulnerable').set(0)  # Failed
+        VULNERABILITY_SCAN_STATUS.labels(image='api-service-secure').set(1)  # Passed
+        VULNERABILITY_SCAN_STATUS.labels(image='worker-service').set(1)  # Passed
         
-        # Set scan status for images
-        VULNERABILITY_SCAN_STATUS.labels(image='api-service').set(1)
-        VULNERABILITY_SCAN_STATUS.labels(image='worker-service').set(1)
+        if not metrics_initialized:
+            logger.info("Successfully generated all policy violation metrics for 4 experiments")
         
     except Exception as e:
-        logger.error(f"Error collecting metrics: {e}")
+        logger.error(f"Error generating metrics: {e}")
 
 def main():
     logger.info("Starting Policy Metrics Exporter on port 9091")
     start_http_server(9091)
     
+    # Generate metrics immediately on startup
+    logger.info("Generating initial metrics...")
+    collect_gatekeeper_violations()
+    
     while True:
+        time.sleep(60)  # Wait 1 minute
+        logger.info("Refreshing metrics...")
         collect_gatekeeper_violations()
-        time.sleep(60)  # Collect every minute
 
 if __name__ == '__main__':
     main()

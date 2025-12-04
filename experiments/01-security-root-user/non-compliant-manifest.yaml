@@ -1,0 +1,113 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: api-service-root-test
+  labels:
+    app: api-service
+    version: "1.0.0"
+    experiment: "01-root-user-violation"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-service-root-test
+  labels:
+    app: api-service
+    experiment: "01-root-user-violation"
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  selector:
+    app: api-service-root-test
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-service-root-test
+  labels:
+    app: api-service
+    version: "1.0.0"
+    experiment: "01-root-user-violation"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api-service-root-test
+  template:
+    metadata:
+      labels:
+        app: api-service-root-test
+        version: "1.0.0"
+    spec:
+      serviceAccountName: api-service-root-test
+      # ❌ VIOLATION: No pod-level security context
+      # Missing: runAsNonRoot, fsGroup, seccompProfile
+      containers:
+      - name: api-service
+        image: "537651148488.dkr.ecr.us-east-1.amazonaws.com/cloud-native-app-dev-api-service:latest"
+        imagePullPolicy: Always
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        # ❌ VIOLATION 1: Running as root user (UID 0)
+        # ❌ VIOLATION 2: Privileged mode enabled
+        # ❌ VIOLATION 3: No readOnlyRootFilesystem
+        # ❌ VIOLATION 4: AllowPrivilegeEscalation not disabled
+        # ❌ VIOLATION 5: Capabilities not dropped
+        securityContext:
+          runAsUser: 0                          # ❌ ROOT USER!
+          runAsNonRoot: false                   # ❌ Allows root
+          privileged: true                       # ❌ Privileged mode
+          readOnlyRootFilesystem: false         # ❌ Writable filesystem
+          allowPrivilegeEscalation: true        # ❌ Can escalate privileges
+          # Missing: capabilities drop
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        resources:
+          limits:
+            cpu: 300m
+            memory: 256Mi
+          requests:
+            cpu: 100m
+            memory: 128Mi
+        env:
+          - name: PORT
+            value: "8080"
+          - name: DB_HOST
+            valueFrom:
+              secretKeyRef:
+                name: db-credentials
+                key: host
+          - name: DB_PORT
+            value: "5432"
+          - name: DB_NAME
+            valueFrom:
+              secretKeyRef:
+                name: db-credentials
+                key: dbname
+          - name: DB_USER
+            valueFrom:
+              secretKeyRef:
+                name: db-credentials
+                key: username
+          - name: DB_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: db-credentials
+                key: password

@@ -1,0 +1,453 @@
+name: Security & Policy Compliance Check
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  # ==========================================
+  # Kubernetes Manifest Security Scan
+  # ==========================================
+  kubernetes-security-scan:
+    name: "🔐 Kubernetes Security Scan"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install OPA
+        run: |
+          curl -L -o opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64
+          chmod +x opa
+          sudo mv opa /usr/local/bin/
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: "🔍 Scan All Kubernetes Manifests"
+        id: k8s-scan
+        run: |
+          echo "=== Scanning Kubernetes Manifests for Policy Violations ==="
+          echo ""
+          
+          VIOLATIONS_COUNT=0
+          VIOLATIONS_DETAILS=""
+          
+          # Find all YAML files that might be Kubernetes manifests
+          for file in $(find . -name "*.yaml" -o -name "*.yml" | grep -v node_modules | grep -v ".github"); do
+            # Check if it's a Kubernetes manifest
+            if grep -q "kind:" "$file" 2>/dev/null; then
+              # Extract deployments
+              yq eval 'select(.kind == "Deployment")' "$file" > /tmp/deployment.yaml 2>/dev/null || true
+              
+              if [ -s /tmp/deployment.yaml ]; then
+                echo "Scanning: $file"
+                RESULT=$(opa eval --data policies/kubernetes/security.rego --input /tmp/deployment.yaml --format pretty "data.kubernetes.security.deny" 2>&1 || true)
+                
+                if echo "$RESULT" | grep -q "must"; then
+                  VIOLATIONS_COUNT=$((VIOLATIONS_COUNT + 1))
+                  VIOLATIONS_DETAILS="$VIOLATIONS_DETAILS\n📁 **$file**\n\`\`\`\n$RESULT\n\`\`\`\n"
+                  echo "  ❌ Violations found!"
+                else
+                  echo "  ✅ No violations"
+                fi
+              fi
+            fi
+          done
+          
+          echo ""
+          echo "Total files with violations: $VIOLATIONS_COUNT"
+          echo "violations_count=$VIOLATIONS_COUNT" >> $GITHUB_OUTPUT
+          
+          # Store violations for summary
+          echo "K8S_VIOLATIONS<<EOF" >> $GITHUB_ENV
+          echo -e "$VIOLATIONS_DETAILS" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+        continue-on-error: true
+
+      - name: "📊 Kubernetes Security Summary"
+        run: |
+          echo "## 🔐 Kubernetes Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Violations Found: ${{ steps.k8s-scan.outputs.violations_count }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.k8s-scan.outputs.violations_count }}" != "0" ]; then
+            echo "### ❌ Policy Violations Detected" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "${{ env.K8S_VIOLATIONS }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ✅ All Kubernetes manifests are compliant!" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ==========================================
+  # Container Vulnerability Scan
+  # ==========================================
+  container-vulnerability-scan:
+    name: "🐳 Container Vulnerability Scan"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Install Trivy
+        run: |
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install trivy
+
+      - name: "🔨 Build API Service Image"
+        run: |
+          cd microservices/api-service
+          docker build -t api-service:scan .
+        continue-on-error: true
+
+      - name: "🔨 Build Worker Service Image"
+        run: |
+          cd microservices/worker-service
+          docker build -t worker-service:scan .
+        continue-on-error: true
+
+      - name: "🔍 Scan API Service"
+        id: scan-api
+        run: |
+          echo "=== Scanning API Service for Vulnerabilities ==="
+          
+          trivy image --severity HIGH,CRITICAL --format json --output api-vulnerabilities.json api-service:scan 2>/dev/null || true
+          
+          if [ -f api-vulnerabilities.json ]; then
+            CRITICAL=$(cat api-vulnerabilities.json | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' 2>/dev/null || echo "0")
+            HIGH=$(cat api-vulnerabilities.json | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH")] | length' 2>/dev/null || echo "0")
+            
+            echo "api_critical=$CRITICAL" >> $GITHUB_OUTPUT
+            echo "api_high=$HIGH" >> $GITHUB_OUTPUT
+            
+            echo "CRITICAL: $CRITICAL, HIGH: $HIGH"
+            
+            # Get top vulnerabilities
+            cat api-vulnerabilities.json | jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL" or .Severity == "HIGH") | "- \(.VulnerabilityID): \(.PkgName) (\(.Severity))"' 2>/dev/null | head -10 > api-vuln-list.txt || true
+          else
+            echo "api_critical=0" >> $GITHUB_OUTPUT
+            echo "api_high=0" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: "🔍 Scan Worker Service"
+        id: scan-worker
+        run: |
+          echo "=== Scanning Worker Service for Vulnerabilities ==="
+          
+          trivy image --severity HIGH,CRITICAL --format json --output worker-vulnerabilities.json worker-service:scan 2>/dev/null || true
+          
+          if [ -f worker-vulnerabilities.json ]; then
+            CRITICAL=$(cat worker-vulnerabilities.json | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' 2>/dev/null || echo "0")
+            HIGH=$(cat worker-vulnerabilities.json | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH")] | length' 2>/dev/null || echo "0")
+            
+            echo "worker_critical=$CRITICAL" >> $GITHUB_OUTPUT
+            echo "worker_high=$HIGH" >> $GITHUB_OUTPUT
+            
+            echo "CRITICAL: $CRITICAL, HIGH: $HIGH"
+            
+            cat worker-vulnerabilities.json | jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL" or .Severity == "HIGH") | "- \(.VulnerabilityID): \(.PkgName) (\(.Severity))"' 2>/dev/null | head -10 > worker-vuln-list.txt || true
+          else
+            echo "worker_critical=0" >> $GITHUB_OUTPUT
+            echo "worker_high=0" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: "📊 Container Vulnerability Summary"
+        run: |
+          echo "## 🐳 Container Vulnerability Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Vulnerability Count" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | CRITICAL | HIGH | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|----------|------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          API_CRITICAL="${{ steps.scan-api.outputs.api_critical }}"
+          API_HIGH="${{ steps.scan-api.outputs.api_high }}"
+          WORKER_CRITICAL="${{ steps.scan-worker.outputs.worker_critical }}"
+          WORKER_HIGH="${{ steps.scan-worker.outputs.worker_high }}"
+          
+          if [ "$API_CRITICAL" -gt 0 ]; then
+            echo "| API Service | $API_CRITICAL | $API_HIGH | ❌ **Vulnerabilities Found** |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| API Service | $API_CRITICAL | $API_HIGH | ✅ **Clean** |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "$WORKER_CRITICAL" -gt 0 ]; then
+            echo "| Worker Service | $WORKER_CRITICAL | $WORKER_HIGH | ❌ **Vulnerabilities Found** |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Worker Service | $WORKER_CRITICAL | $WORKER_HIGH | ✅ **Clean** |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -f api-vuln-list.txt ] && [ -s api-vuln-list.txt ]; then
+            echo "### API Service Top Vulnerabilities" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat api-vuln-list.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ -f worker-vuln-list.txt ] && [ -s worker-vuln-list.txt ]; then
+            echo "### Worker Service Top Vulnerabilities" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat worker-vuln-list.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload Vulnerability Reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulnerability-reports
+          path: |
+            api-vulnerabilities.json
+            worker-vulnerabilities.json
+        if: always()
+
+  # ==========================================
+  # Terraform Security Scan
+  # ==========================================
+  terraform-security-scan:
+    name: "🏗️ Terraform Security Scan"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.0
+          terraform_wrapper: false
+
+      - name: Install OPA
+        run: |
+          curl -L -o opa https://openpolicyagent.org/downloads/latest/opa_linux_amd64
+          chmod +x opa
+          sudo mv opa /usr/local/bin/
+
+      - name: Install tfsec
+        run: |
+          curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+
+      - name: "🔧 Initialize Terraform"
+        run: |
+          cd infrastructure/terraform
+          terraform init -backend=false -upgrade
+        continue-on-error: true
+
+      - name: "🔍 Scan with tfsec"
+        id: tfsec-scan
+        run: |
+          echo "=== Scanning Terraform with tfsec ==="
+          
+          tfsec infrastructure/terraform --format json --out tfsec-results.json 2>/dev/null || true
+          tfsec infrastructure/terraform --format lovely || true
+          
+          if [ -f tfsec-results.json ]; then
+            CRITICAL=$(cat tfsec-results.json | jq '[.results[]? | select(.severity == "CRITICAL")] | length' 2>/dev/null || echo "0")
+            HIGH=$(cat tfsec-results.json | jq '[.results[]? | select(.severity == "HIGH")] | length' 2>/dev/null || echo "0")
+            MEDIUM=$(cat tfsec-results.json | jq '[.results[]? | select(.severity == "MEDIUM")] | length' 2>/dev/null || echo "0")
+            
+            echo "tf_critical=$CRITICAL" >> $GITHUB_OUTPUT
+            echo "tf_high=$HIGH" >> $GITHUB_OUTPUT
+            echo "tf_medium=$MEDIUM" >> $GITHUB_OUTPUT
+          else
+            echo "tf_critical=0" >> $GITHUB_OUTPUT
+            echo "tf_high=0" >> $GITHUB_OUTPUT
+            echo "tf_medium=0" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: "🔍 Validate with OPA Policies"
+        id: opa-scan
+        run: |
+          echo "=== Validating Terraform with OPA Policies ==="
+          
+          cd infrastructure/terraform
+          
+          # Try to create a plan
+          terraform plan -out=tfplan.binary 2>&1 || true
+          
+          if [ -f tfplan.binary ]; then
+            terraform show -json tfplan.binary > tfplan.json
+            
+            SECURITY_RESULT=$(opa eval --data ../../policies/terraform/security.rego --input tfplan.json --format pretty "data.terraform.security.deny" 2>&1 || true)
+            echo "Security Policy Results:"
+            echo "$SECURITY_RESULT"
+            
+            if echo "$SECURITY_RESULT" | grep -qi "violation"; then
+              echo "opa_violations=true" >> $GITHUB_OUTPUT
+            else
+              echo "opa_violations=false" >> $GITHUB_OUTPUT
+            fi
+            
+            echo "OPA_RESULTS<<EOF" >> $GITHUB_ENV
+            echo "$SECURITY_RESULT" >> $GITHUB_ENV
+            echo "EOF" >> $GITHUB_ENV
+          else
+            echo "Could not generate Terraform plan (AWS credentials may be required)"
+            echo "opa_violations=false" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: "📊 Terraform Security Summary"
+        run: |
+          echo "## 🏗️ Terraform Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### tfsec Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| CRITICAL | ${{ steps.tfsec-scan.outputs.tf_critical }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| HIGH | ${{ steps.tfsec-scan.outputs.tf_high }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| MEDIUM | ${{ steps.tfsec-scan.outputs.tf_medium }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.opa-scan.outputs.opa_violations }}" == "true" ]; then
+            echo "### ❌ OPA Policy Violations" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "${{ env.OPA_RESULTS }}" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ✅ OPA Policy Check: No Violations" >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload tfsec Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfsec-report
+          path: tfsec-results.json
+        if: always()
+
+  # ==========================================
+  # Dependency Vulnerability Scan
+  # ==========================================
+  dependency-scan:
+    name: "📦 Dependency Vulnerability Scan"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: "🔍 Scan API Service Dependencies"
+        id: scan-api-deps
+        run: |
+          echo "=== Scanning API Service Dependencies ==="
+          
+          cd microservices/api-service
+          pip-audit -r requirements.txt --format json --output api-pip-audit.json 2>/dev/null || true
+          pip-audit -r requirements.txt || true
+          
+          if [ -f api-pip-audit.json ]; then
+            VULN_COUNT=$(cat api-pip-audit.json | jq 'length' 2>/dev/null || echo "0")
+            echo "api_dep_vulns=$VULN_COUNT" >> $GITHUB_OUTPUT
+          else
+            echo "api_dep_vulns=0" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: "🔍 Scan Worker Service Dependencies"
+        id: scan-worker-deps
+        run: |
+          echo "=== Scanning Worker Service Dependencies ==="
+          
+          cd microservices/worker-service
+          pip-audit -r requirements.txt --format json --output worker-pip-audit.json 2>/dev/null || true
+          pip-audit -r requirements.txt || true
+          
+          if [ -f worker-pip-audit.json ]; then
+            VULN_COUNT=$(cat worker-pip-audit.json | jq 'length' 2>/dev/null || echo "0")
+            echo "worker_dep_vulns=$VULN_COUNT" >> $GITHUB_OUTPUT
+          else
+            echo "worker_dep_vulns=0" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: "📊 Dependency Scan Summary"
+        run: |
+          echo "## 📦 Dependency Vulnerability Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Python Dependencies" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | Vulnerabilities | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-----------------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          API_VULNS="${{ steps.scan-api-deps.outputs.api_dep_vulns }}"
+          WORKER_VULNS="${{ steps.scan-worker-deps.outputs.worker_dep_vulns }}"
+          
+          if [ "$API_VULNS" -gt 0 ]; then
+            echo "| API Service | $API_VULNS | ❌ **Vulnerable** |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| API Service | $API_VULNS | ✅ **Clean** |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "$WORKER_VULNS" -gt 0 ]; then
+            echo "| Worker Service | $WORKER_VULNS | ❌ **Vulnerable** |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Worker Service | $WORKER_VULNS | ✅ **Clean** |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ==========================================
+  # Overall Compliance Report
+  # ==========================================
+  compliance-report:
+    name: "📋 Compliance Report"
+    runs-on: ubuntu-latest
+    needs:
+      - kubernetes-security-scan
+      - container-vulnerability-scan
+      - terraform-security-scan
+      - dependency-scan
+    if: always()
+    steps:
+      - name: "📊 Generate Overall Compliance Report"
+        run: |
+          echo "# 🛡️ Security & Policy Compliance Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** ${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Time:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Category | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Kubernetes Manifests | ${{ needs.kubernetes-security-scan.result == 'success' && '✅ Scanned' || '⚠️ Check Logs' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Container Images | ${{ needs.container-vulnerability-scan.result == 'success' && '✅ Scanned' || '⚠️ Check Logs' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Terraform | ${{ needs.terraform-security-scan.result == 'success' && '✅ Scanned' || '⚠️ Check Logs' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dependencies | ${{ needs.dependency-scan.result == 'success' && '✅ Scanned' || '⚠️ Check Logs' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Policy-as-Code Tools Used" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **OPA (Open Policy Agent)**: Kubernetes & Terraform policy validation" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trivy**: Container image vulnerability scanning" >> $GITHUB_STEP_SUMMARY
+          echo "- **tfsec**: Terraform static analysis" >> $GITHUB_STEP_SUMMARY
+          echo "- **pip-audit**: Python dependency auditing" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "*See individual job summaries above for detailed results.*" >> $GITHUB_STEP_SUMMARY

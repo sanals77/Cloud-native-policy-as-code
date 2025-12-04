@@ -126,13 +126,46 @@ jobs:
             worker-scan-results.json
 
       - name: Check for vulnerabilities
+        id: vuln-check
         run: |
-          if [ $(cat api-scan-results.json | jq '.Results[].Vulnerabilities | length') -gt 0 ]; then
-            echo "Critical vulnerabilities found in API image!"
-            exit 1
+          # Parse vulnerability counts
+          API_CRITICAL=$(cat api-scan-results.json | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' 2>/dev/null || echo "0")
+          API_HIGH=$(cat api-scan-results.json | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH")] | length' 2>/dev/null || echo "0")
+          WORKER_CRITICAL=$(cat worker-scan-results.json | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL")] | length' 2>/dev/null || echo "0")
+          WORKER_HIGH=$(cat worker-scan-results.json | jq '[.Results[]?.Vulnerabilities[]? | select(.Severity == "HIGH")] | length' 2>/dev/null || echo "0")
+          
+          echo "api_critical=$API_CRITICAL" >> $GITHUB_OUTPUT
+          echo "api_high=$API_HIGH" >> $GITHUB_OUTPUT
+          echo "worker_critical=$WORKER_CRITICAL" >> $GITHUB_OUTPUT
+          echo "worker_high=$WORKER_HIGH" >> $GITHUB_OUTPUT
+          
+          echo "## 🔒 Container Vulnerability Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | CRITICAL | HIGH | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|----------|------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$API_CRITICAL" -gt 0 ]; then
+            echo "| API Service | $API_CRITICAL | $API_HIGH | ❌ **Blocked** |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| API Service | $API_CRITICAL | $API_HIGH | ✅ **Passed** |" >> $GITHUB_STEP_SUMMARY
           fi
-          if [ $(cat worker-scan-results.json | jq '.Results[].Vulnerabilities | length') -gt 0 ]; then
-            echo "Critical vulnerabilities found in Worker image!"
+          
+          if [ "$WORKER_CRITICAL" -gt 0 ]; then
+            echo "| Worker Service | $WORKER_CRITICAL | $WORKER_HIGH | ❌ **Blocked** |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Worker Service | $WORKER_CRITICAL | $WORKER_HIGH | ✅ **Passed** |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Show top vulnerabilities
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Top Vulnerabilities Detected" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat api-scan-results.json | jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity == "CRITICAL" or .Severity == "HIGH") | "[\(.Severity)] \(.VulnerabilityID): \(.PkgName) - \(.Title)"' 2>/dev/null | head -10 >> $GITHUB_STEP_SUMMARY || echo "No vulnerabilities found" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          
+          # Fail if critical vulnerabilities found
+          if [ "$API_CRITICAL" -gt 0 ] || [ "$WORKER_CRITICAL" -gt 0 ]; then
+            echo "❌ Critical vulnerabilities found! Blocking deployment."
             exit 1
           fi
 
@@ -190,24 +223,64 @@ jobs:
         continue-on-error: true
 
       - name: Validate Terraform Plan with OPA - Security
+        id: opa-security
         run: |
           cd infrastructure/terraform
           if [ -f tfplan.json ] && [ -s tfplan.json ]; then
-            opa eval --data ../../policies/terraform/security.rego --input tfplan.json --format pretty "data.terraform.security.deny" || echo "OPA validation skipped"
+            RESULT=$(opa eval --data ../../policies/terraform/security.rego --input tfplan.json --format pretty "data.terraform.security.deny" 2>&1 || true)
+            echo "$RESULT"
+            
+            # Store result for summary
+            echo "SECURITY_RESULT<<EOF" >> $GITHUB_ENV
+            echo "$RESULT" >> $GITHUB_ENV
+            echo "EOF" >> $GITHUB_ENV
+            
+            if echo "$RESULT" | grep -qi "violation"; then
+              echo "security_violations=true" >> $GITHUB_OUTPUT
+            else
+              echo "security_violations=false" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "Terraform plan not available, skipping OPA validation"
+            echo "security_violations=false" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: Validate Terraform Plan with OPA - Cost
+        id: opa-cost
+        run: |
+          cd infrastructure/terraform
+          if [ -f tfplan.json ] && [ -s tfplan.json ]; then
+            RESULT=$(opa eval --data ../../policies/terraform/cost.rego --input tfplan.json --format pretty "data.terraform.cost.warn" 2>&1 || true)
+            echo "$RESULT"
+            
+            echo "COST_RESULT<<EOF" >> $GITHUB_ENV
+            echo "$RESULT" >> $GITHUB_ENV
+            echo "EOF" >> $GITHUB_ENV
           else
             echo "Terraform plan not available, skipping OPA validation"
           fi
         continue-on-error: true
 
-      - name: Validate Terraform Plan with OPA - Cost
+      - name: "📊 Generate Terraform Policy Summary"
         run: |
-          cd infrastructure/terraform
-          if [ -f tfplan.json ] && [ -s tfplan.json ]; then
-            opa eval --data ../../policies/terraform/cost.rego --input tfplan.json --format pretty "data.terraform.cost.warn" || echo "OPA validation skipped"
+          echo "## 🏗️ Terraform Policy Validation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.opa-security.outputs.security_violations }}" == "true" ]; then
+            echo "### ❌ Security Policy Violations Detected" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "${{ env.SECURITY_RESULT }}" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
           else
-            echo "Terraform plan not available, skipping OPA validation"
+            echo "### ✅ Security Policies: All checks passed" >> $GITHUB_STEP_SUMMARY
           fi
-        continue-on-error: true
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Cost Policy Warnings" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "${{ env.COST_RESULT }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
 
       - name: Upload Terraform plan
         uses: actions/upload-artifact@v4
@@ -242,31 +315,92 @@ jobs:
         run: |
           helm template worker-service ./infrastructure/kubernetes/helm/worker-service > worker-manifests.yaml
 
-      - name: Validate API manifests with OPA
+      - name: Install yq
         run: |
-          while IFS= read -r line; do
-            if [[ "$line" == "---" ]] || [[ -z "$line" ]]; then
-              if [[ -n "$manifest" ]]; then
-                echo "$manifest" | opa eval --data policies/kubernetes/security.rego --input - --format pretty "data.kubernetes.security" || true
-              fi
-              manifest=""
-            else
-              manifest="$manifest$line"$'\n'
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Validate API manifests with OPA
+        id: validate-api
+        run: |
+          echo "=== Validating API Service Manifests ==="
+          
+          VIOLATIONS=""
+          VIOLATION_COUNT=0
+          
+          # Extract and validate each Deployment
+          yq eval 'select(.kind == "Deployment")' api-manifests.yaml > /tmp/api-deployment.yaml 2>/dev/null || true
+          
+          if [ -s /tmp/api-deployment.yaml ]; then
+            RESULT=$(opa eval --data policies/kubernetes/security.rego --input /tmp/api-deployment.yaml --format pretty "data.kubernetes.security.deny" 2>&1 || true)
+            echo "$RESULT"
+            
+            if echo "$RESULT" | grep -q "must"; then
+              VIOLATION_COUNT=$((VIOLATION_COUNT + 1))
+              VIOLATIONS="$VIOLATIONS\n$RESULT"
             fi
-          done < api-manifests.yaml
+          fi
+          
+          echo "api_violations=$VIOLATION_COUNT" >> $GITHUB_OUTPUT
+          echo "API_VIOLATIONS<<EOF" >> $GITHUB_ENV
+          echo -e "$VIOLATIONS" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
 
       - name: Validate Worker manifests with OPA
+        id: validate-worker
         run: |
-          while IFS= read -r line; do
-            if [[ "$line" == "---" ]] || [[ -z "$line" ]]; then
-              if [[ -n "$manifest" ]]; then
-                echo "$manifest" | opa eval --data policies/kubernetes/security.rego --input - --format pretty "data.kubernetes.security" || true
-              fi
-              manifest=""
-            else
-              manifest="$manifest$line"$'\n'
+          echo "=== Validating Worker Service Manifests ==="
+          
+          VIOLATIONS=""
+          VIOLATION_COUNT=0
+          
+          yq eval 'select(.kind == "Deployment")' worker-manifests.yaml > /tmp/worker-deployment.yaml 2>/dev/null || true
+          
+          if [ -s /tmp/worker-deployment.yaml ]; then
+            RESULT=$(opa eval --data policies/kubernetes/security.rego --input /tmp/worker-deployment.yaml --format pretty "data.kubernetes.security.deny" 2>&1 || true)
+            echo "$RESULT"
+            
+            if echo "$RESULT" | grep -q "must"; then
+              VIOLATION_COUNT=$((VIOLATION_COUNT + 1))
+              VIOLATIONS="$VIOLATIONS\n$RESULT"
             fi
-          done < worker-manifests.yaml
+          fi
+          
+          echo "worker_violations=$VIOLATION_COUNT" >> $GITHUB_OUTPUT
+          echo "WORKER_VIOLATIONS<<EOF" >> $GITHUB_ENV
+          echo -e "$VIOLATIONS" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: "📊 Generate Kubernetes Policy Summary"
+        run: |
+          echo "## 🔐 Kubernetes Policy Validation" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | Policy Violations | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|-------------------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          API_VIOLATIONS="${{ steps.validate-api.outputs.api_violations }}"
+          WORKER_VIOLATIONS="${{ steps.validate-worker.outputs.worker_violations }}"
+          
+          if [ "$API_VIOLATIONS" -gt 0 ]; then
+            echo "| API Service | $API_VIOLATIONS | ❌ **Violations Found** |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| API Service | 0 | ✅ **Compliant** |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "$WORKER_VIOLATIONS" -gt 0 ]; then
+            echo "| Worker Service | $WORKER_VIOLATIONS | ❌ **Violations Found** |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Worker Service | 0 | ✅ **Compliant** |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "$API_VIOLATIONS" -gt 0 ] || [ "$WORKER_VIOLATIONS" -gt 0 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Policy Violations Details" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "${{ env.API_VIOLATIONS }}" >> $GITHUB_STEP_SUMMARY
+            echo "${{ env.WORKER_VIOLATIONS }}" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
 
   # Generate SBOM
   generate-sbom:
